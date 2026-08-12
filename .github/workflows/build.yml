@@ -1,0 +1,63 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Locate the project (extract zip if needed)
+        id: locate
+        run: |
+          if ls *.zip >/dev/null 2>&1; then
+            ZIP_FILE=$(ls *.zip | head -n 1)
+            echo "Found $ZIP_FILE — extracting it"
+            unzip -o "$ZIP_FILE"
+            PROJECT_DIR=$(find . -maxdepth 1 -type d -name "VideoSlideMaker*" | head -n 1)
+            echo "dir=${PROJECT_DIR#./}" >> "$GITHUB_OUTPUT"
+          elif [ -f "settings.gradle.kts" ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Couldn't find settings.gradle.kts or a .zip at the repo root."
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install required SDK packages
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Install a temporary Gradle to (re)generate the wrapper
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate Gradle wrapper
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Make gradlew executable
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoSlideMaker-debug-apk
+          path: ${{ steps.locate.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
