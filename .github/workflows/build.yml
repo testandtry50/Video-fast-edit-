@@ -1,5 +1,9 @@
+# Put this file in your repository at:  .github/workflows/build.yml  (replace the old one).
+# The old one forced Gradle 8.7, but this project needs Gradle 8.11.1 or newer.
 name: Build APK
 
+# Runs automatically every time you push to main, and can also be triggered manually
+# from the Actions tab ("Run workflow" button).
 on:
   push:
     branches: [ main, master ]
@@ -7,11 +11,19 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned: GitHub moves "ubuntu-latest" to Ubuntu 26 from 19 Oct 2026, which could break the Android SDK setup.
+    runs-on: ubuntu-24.04
+    # Signing secrets for the Play Store bundle (see PLAY_STORE_CHECKLIST.md). When they are not set, the
+    # debug APK and the tests still run exactly as before and the signed bundle step is skipped.
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Works whether you pushed the extracted project directly, or just uploaded the
+      # VideoSlideMaker-Android.zip file itself through GitHub's website — either way,
+      # this step figures out where the real project files ended up.
       - name: Locate the project (extract zip if needed)
         id: locate
         run: |
@@ -22,9 +34,10 @@ jobs:
             PROJECT_DIR=$(find . -maxdepth 1 -type d -name "VideoSlideMaker*" | head -n 1)
             echo "dir=${PROJECT_DIR#./}" >> "$GITHUB_OUTPUT"
           elif [ -f "settings.gradle.kts" ]; then
+            echo "Project already at repo root"
             echo "dir=." >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Couldn't find settings.gradle.kts or a .zip at the repo root."
+            echo "::error::Couldn't find settings.gradle.kts or a .zip to extract at the repo root."
             exit 1
           fi
 
@@ -37,16 +50,20 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install required SDK packages
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      # Google Play needs apps to target Android 16 (API 36); the Android Gradle plugin 8.9 uses build-tools 35.
+      - name: Install the exact SDK platform/build-tools this project needs
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
 
+      # This project's Gradle wrapper jar wasn't generated in the sandbox it was written in
+      # (no internet access there). These two steps regenerate a complete, working wrapper
+      # before the real build runs, so everything below behaves like any normal Android project.
       - name: Install a temporary Gradle to (re)generate the wrapper
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.11.1'
       - name: Generate Gradle wrapper
         working-directory: ${{ steps.locate.outputs.dir }}
-        run: gradle wrapper --gradle-version 8.7
+        run: gradle wrapper --gradle-version 8.11.1
 
       - name: Make gradlew executable
         working-directory: ${{ steps.locate.outputs.dir }}
@@ -61,3 +78,40 @@ jobs:
         with:
           name: VideoSlideMaker-debug-apk
           path: ${{ steps.locate.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Run unit tests
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      # Google Play rejects apps whose native libraries are not aligned for 16 KB memory pages. This only REPORTS (it
+      # never fails the build); the same check on the signed bundle is in the checklist.
+      - name: Check 16 KB page-size alignment (report only)
+        continue-on-error: true
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          ZIPALIGN=$(find "$ANDROID_SDK_ROOT/build-tools" -name zipalign | sort | tail -1)
+          "$ZIPALIGN" -c -P 16 -v 4 app/build/outputs/apk/debug/app-debug.apk | tail -n 8
+
+      - name: Prepare the signing key
+        if: env.KEYSTORE_BASE64 != ''
+        run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload-key.jks"
+
+      # The file Google Play wants. Upload app-release.aab in Play Console > Release > Production (or Testing).
+      - name: Build the signed Play Store bundle (AAB)
+        if: env.KEYSTORE_BASE64 != ''
+        working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/upload-key.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew bundleRelease --stacktrace
+
+      - name: Upload the Play Store bundle
+        if: env.KEYSTORE_BASE64 != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoSlideMaker-release-aab
+          path: |
+            ${{ steps.locate.outputs.dir }}/app/build/outputs/bundle/release/app-release.aab
+            ${{ steps.locate.outputs.dir }}/app/build/outputs/mapping/release/mapping.txt
